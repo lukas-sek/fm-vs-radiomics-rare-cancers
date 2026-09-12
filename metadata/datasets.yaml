@@ -1,0 +1,136 @@
+
+source:
+  name: WORC Database
+  project_url: https://xnat.health-ri.nl/data/projects/worc
+  dataset_paper: https://doi.org/10.1101/2021.08.19.21262238.
+
+datasets:
+  Lipo:
+    patients_reported: 115
+    lesions_reported: 116
+    modality: MRI
+    acquisition: T1-weighted
+    prediction_target: MDM2 amplification status
+    positive_class:
+      value: 1
+      meaning: well-differentiated liposarcoma (WDLPS)
+      lesions_reported: 58
+    negative_class:
+      value: 0
+      meaning: lipoma
+      lesions_reported: 58
+    label_level: lesion
+    split_level: patient
+    notes:
+      - One patient has both a WDLPS and a lipoma.
+      - That patient has separate WDLPS and lipoma segmentation files.
+
+  Desmoid:
+    patients_reported: 203
+    lesions_reported: 203
+    modality: MRI
+    acquisition: T1-weighted
+    prediction_target: differential diagnosis confirmed by histology
+    positive_class:
+      value: 1
+      meaning: desmoid-type fibromatosis (DTF)
+      patients_reported: 72
+    negative_class:
+      value: 0
+      meaning: extremity soft-tissue sarcoma (non-DTF)
+      patients_reported: 131
+    negative_class_subtypes:
+      myxofibrosarcoma: 64
+      leiomyosarcoma: 31
+      myxoid_liposarcoma: 36
+    
+
+  Liver:
+    patients_reported: 186
+    modality: MRI
+    acquisition: T2-weighted
+    prediction_target: malignant versus benign primary solid liver tumor
+    positive_class:
+      value: 1
+      meaning: malignant
+      cases_reported: 94
+      subtypes:
+        hepatocellular_carcinoma: 81
+        intrahepatic_cholangiocarcinoma: 13
+    negative_class:
+      value: 0
+      meaning: benign
+      cases_reported: 93
+      subtypes:
+        hepatocellular_adenoma: 48
+        focal_nodular_hyperplasia: 44
+    notes:
+      - Pathology established ground truth except for radiologically typical FNH.
+      - Reported class counts sum to 187 while the paper reports 186 patients.
+      - Reported benign subtype counts sum to 92 while 93 benign cases are reported.
+
+  GIST:
+    patients_reported: 246
+    lesions_reported: 247
+    modality: CT
+    acquisition: contrast-enhanced venous phase
+    prediction_target: histologically confirmed GIST versus non-GIST
+    positive_class:
+      value: 1
+      meaning: gastrointestinal stromal tumor (GIST)
+      lesions_reported: 125
+    negative_class:
+      value: 0
+      meaning: radiologically similar intra-abdominal tumor (non-GIST)
+      lesions_reported: 122
+    negative_class_subtypes:
+      schwannoma: 22
+      leiomyosarcoma: 25
+      leiomyoma: 25
+      esophageal_or_gastric_junctional_adenocarcinoma: 25
+      lymphoma: 25
+    notes:
+      - One patient has two GIST lesions.
+
+  CRLM:
+    patients_reported: 77
+    lesions_reported: 93
+    modality: CT
+    acquisition: portal venous phase
+    prediction_target: histopathological growth pattern (HGP)
+    positive_class:
+      value: 1
+      meaning: 100% replacement HGP
+      lesions_reported: 47
+    negative_class:
+      value: 0
+      meaning: 100% desmoplastic HGP
+      lesions_reported: 46
+    segmentation_sources:
+      - STUD1
+      - STUD2
+      - PhD
+      - RAD
+      - CNN
+    notes:
+      - HGP is assumed to be identical for all lesions belonging to a patient.
+      - STUD2 is a repeat segmentation by the first observer.
+      - The CNN missed 8 of 93 lesions, so those CNN segmentations are absent.
+      - An earlier publication reported 76 patients, but the dataset contains 77.
+
+  Melanoma:
+    patients_reported: 103
+    lesions_reported: 169
+    modality: CT
+    acquisition: contrast-enhanced thoracic
+    prediction_target: BRAF mutation status
+    positive_class:
+      value: 1
+      meaning: BRAF mutated
+      patients_reported: 51
+    negative_class:
+      value: 0
+      meaning: BRAF wild type
+      patients_reported: 52
+    notes:
+      - Mutation status is assumed to be identical for all lesions of a patient.
