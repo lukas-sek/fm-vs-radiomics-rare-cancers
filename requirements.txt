@@ -1,0 +1,25 @@
+# Requires Python >=3.9,<3.12 (foundation-cancer-image-biomarker does not support 3.12+)
+# Create the env with:
+#   py -3.11 -m venv .venv
+#   .\.venv\Scripts\Activate.ps1
+#   pip install -r requirements.txt
+
+# Install FMCIB first — it pins pandas<2, scipy==1.10, and related deps.
+foundation-cancer-image-biomarker>=1.0.0
+
+# Full-lesion crop / CSV pipeline (scripts/build_fmcib_full_lesion_csvs.py)
+# numpy/pandas versions are resolved by FMCIB above.
+SimpleITK>=2.2
+PyYAML>=6.0
+
+# Radiomics baseline comparison
+pyradiomics>=3.0.1
+scikit-learn>=1.3
+scikit-image>=0.21
+PyWavelets>=1.4
+
+# Notebooks / visualization
+matplotlib>=3.7
+tqdm>=4.65
+jupyter>=1.0
+ipykernel>=6.0
