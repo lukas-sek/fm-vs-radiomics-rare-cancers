@@ -1,6 +1,7 @@
 """Classify Melanoma BRAF status from FMCIB features with Optuna-tuned Logistic Regression.
 
-Train/Test: Melanoma_Fmcib_original_features.csv (no augmentation; matched feature domain)
+Train: Melanoma_fmcib_augmentation_features.csv (train patients, all aug slots)
+Test:  Melanoma_Fmcib_original_features.csv (test patients only)
 Labels: metadata/pinfo_Melanoma.csv (Patient -> Diagnosis)
 Splits: crossvalidationsplits/crossvalidationsplits_Melanoma.csv
 """
@@ -139,7 +140,13 @@ def parse_args() -> argparse.Namespace:
         "--orig-features",
         type=Path,
         default=Path.home() / "experiments" / "Results" / "FMCIB" / "Melanoma_Fmcib_original_features.csv",
-        help="Original CT features (used for both train and test patients)",
+        help="Test-set features (original CTs)",
+    )
+    parser.add_argument(
+        "--aug-features",
+        type=Path,
+        default=Path.home() / "experiments" / "Results" / "FMCIB" / "Melanoma_fmcib_augmentation_features.csv",
+        help="Train-set features (augmented patches)",
     )
     parser.add_argument(
         "--splits",
@@ -171,19 +178,24 @@ def main() -> None:
 
     pinfo = load_pinfo(args.pinfo)
     df_orig = attach_pinfo_labels(load_file(args.orig_features), pinfo)
+    df_aug = attach_pinfo_labels(load_file(args.aug_features), pinfo)
 
     feature_cols = get_feature_cols(df_orig)
+    aug_cols = get_feature_cols(df_aug)
+    if feature_cols != aug_cols:
+        raise SystemExit("Feature column mismatch between original and augmented files")
     if len(feature_cols) != 4096:
         print(f"Warning: expected 4096 pred_* features, got {len(feature_cols)}")
 
     folds = load_worc_splits(args.splits)
     print(f"Loaded {len(folds)} WORC folds from {args.splits}")
-    print(f"Features (train+test): {args.orig_features}")
+    print(f"Train source: {args.aug_features}")
+    print(f"Test source:  {args.orig_features}")
 
     per_split_rows: list[dict] = []
 
     for split_idx, (train_pids, test_pids) in enumerate(folds):
-        train_df = df_orig[df_orig["patient_id"].astype(str).isin(train_pids)].copy()
+        train_df = df_aug[df_aug["patient_id"].astype(str).isin(train_pids)].copy()
         test_df = df_orig[df_orig["patient_id"].astype(str).isin(test_pids)].copy()
 
         if train_df.empty or test_df.empty:

@@ -1,6 +1,7 @@
 """Classify Melanoma BRAF status from FMCIB features across WORC CV splits.
 
-Train/Test: Melanoma_Fmcib_original_features.csv (no augmentation; matched feature domain)
+Train: Melanoma_fmcib_augmentation_features.csv (train patients, all aug slots)
+Test:  Melanoma_Fmcib_original_features.csv (test patients only)
 Labels: metadata/pinfo_Melanoma.csv (Patient -> Diagnosis)
 Splits: crossvalidationsplits/crossvalidationsplits_Melanoma.csv
 
@@ -238,6 +239,7 @@ def parse_args() -> argparse.Namespace:
     )
     # Optional overrides (None = keep YAML value)
     parser.add_argument("--orig-features", type=Path, default=None)
+    parser.add_argument("--aug-features", type=Path, default=None)
     parser.add_argument("--splits", type=Path, default=None)
     parser.add_argument("--pinfo", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -268,6 +270,10 @@ def build_settings(args: argparse.Namespace) -> dict[str, Any]:
             pick(args.orig_features, "orig_features"),
             PATH_ROOT,
         ),
+        "aug_features": resolve_path(
+            pick(args.aug_features, "aug_features"),
+            PATH_ROOT,
+        ),
         "splits": resolve_path(pick(args.splits, "splits"), PATH_ROOT),
         "pinfo": resolve_path(pick(args.pinfo, "pinfo"), PATH_ROOT),
         "output_dir": resolve_path(
@@ -291,6 +297,7 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"pinfo:          {cfg['pinfo']}")
     print(f"orig_features:  {cfg['orig_features']}")
+    print(f"aug_features:   {cfg['aug_features']}")
     print(f"splits:         {cfg['splits']}")
     print(f"output_dir:     {cfg['output_dir']}")
     print(
@@ -300,19 +307,24 @@ def main() -> None:
 
     pinfo = load_pinfo(cfg["pinfo"])
     df_orig = attach_pinfo_labels(load_file(cfg["orig_features"]), pinfo)
+    df_aug = attach_pinfo_labels(load_file(cfg["aug_features"]), pinfo)
 
     feature_cols = get_feature_cols(df_orig)
+    aug_cols = get_feature_cols(df_aug)
+    if feature_cols != aug_cols:
+        raise SystemExit("Feature column mismatch between original and augmented files")
     if len(feature_cols) != 4096:
         print(f"Warning: expected 4096 pred_* features, got {len(feature_cols)}")
 
     folds = load_worc_splits(cfg["splits"])
     print(f"Loaded {len(folds)} WORC folds from {cfg['splits']}")
-    print(f"Features (train+test): {cfg['orig_features']}")
+    print(f"Train source: {cfg['aug_features']}")
+    print(f"Test source:  {cfg['orig_features']}")
 
     per_split_rows: list[dict] = []
 
     for split_idx, (train_pids, test_pids) in enumerate(folds):
-        train_data = df_orig[df_orig["patient_id"].astype(str).isin(train_pids)].copy()
+        train_data = df_aug[df_aug["patient_id"].astype(str).isin(train_pids)].copy()
         test_data = df_orig[df_orig["patient_id"].astype(str).isin(test_pids)].copy()
 
         if train_data.empty or test_data.empty:

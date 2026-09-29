@@ -1,7 +1,8 @@
-# Absolute paths for aimlab (/home/lukas/...). No augmentation: train+test on original features.
+
 
 paths:
   orig_features: /home/lukas/experiments/Results/FMCIB/Melanoma_Fmcib_original_features.csv
+  aug_features: /home/lukas/experiments/Results/FMCIB/Melanoma_fmcib_augmentation_features.csv
   splits: /home/lukas/crossvalidationsplits/crossvalidationsplits_Melanoma.csv
   pinfo: /home/lukas/metadata/pinfo_Melanoma.csv
   output_dir: /home/lukas/experiments/Results/FMCIB
