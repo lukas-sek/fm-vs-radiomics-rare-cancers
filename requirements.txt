@@ -12,6 +12,9 @@ foundation-cancer-image-biomarker>=1.0.0
 SimpleITK>=2.2
 PyYAML>=6.0
 
+# Patch augmentation pipeline (scripts/extract_fmcib_patches.py)
+monai>=1.3
+
 # Radiomics baseline comparison
 pyradiomics>=3.0.1
 scikit-learn>=1.3

@@ -17,7 +17,8 @@ pip install -r requirements.txt
 - `docs/datasets.md` documents the cohorts, targets, modalities, and known count discrepancies.
 - `metadata/datasets.yaml` contains machine-readable dataset-level definitions.
 - `metadata/pinfo_*.csv` stores per-dataset patient labels.
-- `metadata/fmcib_full_lesion_*.csv` and `metadata/fmcib_full_image_*.csv` are FMCIB feature-extraction CSVs for full-lesion and full-image crops.
+- `metadata/fmcib_full_lesion_*.csv` and `metadata/fmcib_full_image_*.csv` are FMCIB feature-extraction CSVs for full-lesion and full-image crops (`precropped=True`).
+- `metadata/fmcib_original_Melanoma.csv` points at original WORC Melanoma images with CoM seeds (`get_features(..., precropped=False)`).
 - `crossvalidationsplits/` contains the original WORC patient-level splits and should remain unchanged.
 
 Imaging data is stored locally under `data/` (for example `data/worc/{Dataset}/{PatientID}/`) and is excluded from Git. Paths recorded in manifests should be relative to the repository root.
@@ -45,6 +46,7 @@ or by running `Voxel_spacing_analysis_worc.ipynb` (writes the same CSV/PNG outpu
 ## Scripts
 
 - `scripts/build_fmcib_full_lesion_csvs.py` — builds full-lesion `50³` crops under `data/fmcib_full_lesion/` and corresponding FMCIB CSVs.
+- `scripts/build_fmcib_original_melanoma_csv.py` — Melanoma CSV with original image paths and CoM seeds (`metadata/fmcib_original_Melanoma.csv`).
 - `scripts/analyze_worc_original_spacing.py` — scans original WORC NIfTIs and writes `metadata/worc_original_spacing.csv` with console summaries.
 
 ## Notebooks
