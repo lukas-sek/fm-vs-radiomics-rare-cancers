@@ -4,29 +4,36 @@ Train: Melanoma_fmcib_augmentation_features.csv (train patients, all aug slots)
 Test:  Melanoma_Fmcib_original_features.csv (test patients only)
 Labels: metadata/pinfo_Melanoma.csv (Patient -> Diagnosis)
 Splits: crossvalidationsplits/crossvalidationsplits_Melanoma.csv
+
+Parameters are loaded from a YAML config (default: mlp_config.yaml next to this script).
+CLI flags override individual YAML values when provided.
 """
 from __future__ import annotations
 
 import argparse
 import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import yaml
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader, TensorDataset
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+_HERE = Path(__file__).resolve().parent
+REPO_ROOT = _HERE.parent if _HERE.name.upper() == "FMCIB" else _HERE
+PATH_ROOT = Path.home()
+DEFAULT_CONFIG = _HERE / "mlp_config.yaml"
 
 
 class MLP(nn.Module):
     def __init__(self, in_features: int):
         super().__init__()
-        # FMCIB Task 2/3 classification head structure
         if in_features == 4096:
             self.net = nn.Sequential(
                 nn.Linear(4096, 2048),
@@ -118,6 +125,21 @@ def load_worc_splits(path: Path) -> list[tuple[set[str], set[str]]]:
     return folds
 
 
+def resolve_path(value: str | Path, root: Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else (root / path).resolve()
+
+
+def load_yaml_config(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise SystemExit(f"Config not found: {path}")
+    with open(path, encoding="utf-8") as fp:
+        cfg = yaml.safe_load(fp) or {}
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"Config must be a mapping: {path}")
+    return cfg
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -169,6 +191,8 @@ def run_split(
     epochs: int,
     batch_size: int,
     lr: float,
+    scheduler_step_size: int,
+    scheduler_gamma: float,
     device: torch.device,
 ) -> tuple[float, float]:
     scaler = StandardScaler()
@@ -191,22 +215,16 @@ def run_split(
 
     model = MLP(in_features=len(feature_cols)).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    scheduler = StepLR(optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma)
     criterion = nn.BCEWithLogitsLoss()
-
-    best_auc = -1.0
-    best_ap = -1.0
 
     for _ in range(epochs):
         train_epoch(model, train_loader, optimizer, criterion, device)
         scheduler.step()
 
-        auc, ap, _, _ = evaluate(model, test_loader, device)
-        if not np.isnan(auc) and auc > best_auc:
-            best_auc = auc
-            best_ap = ap
-
-    return best_auc, best_ap
+    # Fixed protocol: evaluate once after the final epoch (no test-set model selection).
+    auc, ap, _, _ = evaluate(model, test_loader, device)
+    return auc, ap
 
 
 def parse_args() -> argparse.Namespace:
@@ -214,54 +232,82 @@ def parse_args() -> argparse.Namespace:
         description="Melanoma BRAF MLP on FMCIB features with WORC CV splits."
     )
     parser.add_argument(
-        "--orig-features",
+        "--config",
         type=Path,
-        default=REPO_ROOT / "Results" / "fmcib" / "Melanoma_Fmcib_original_features.csv",
-        help="Test-set features (original CTs)",
+        default=DEFAULT_CONFIG,
+        help=f"YAML config path (default: {DEFAULT_CONFIG})",
     )
-    parser.add_argument(
-        "--aug-features",
-        type=Path,
-        default=REPO_ROOT / "Results" / "fmcib" / "Melanoma_fmcib_augmentation_features.csv",
-        help="Train-set features (augmented patches)",
-    )
-    parser.add_argument(
-        "--splits",
-        type=Path,
-        default=REPO_ROOT / "crossvalidationsplits" / "crossvalidationsplits_Melanoma.csv",
-        help="WORC wide CV CSV (i_train / i_test columns)",
-    )
-    parser.add_argument(
-        "--pinfo",
-        type=Path,
-        default=REPO_ROOT / "metadata" / "pinfo_Melanoma.csv",
-        help="Patient-level Diagnosis labels",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=REPO_ROOT / "experiments" / "results" / "fmcib",
-        help="Directory for metrics CSVs",
-    )
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.0125,
-        help="Default corresponds to FMCIB dynamic formula: ((32 * 1) / 256) * 0.1 = 0.0125",
-    )
+    # Optional overrides (None = keep YAML value)
+    parser.add_argument("--orig-features", type=Path, default=None)
+    parser.add_argument("--aug-features", type=Path, default=None)
+    parser.add_argument("--splits", type=Path, default=None)
+    parser.add_argument("--pinfo", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
     return parser.parse_args()
+
+
+def build_settings(args: argparse.Namespace) -> dict[str, Any]:
+    cfg = load_yaml_config(args.config)
+    paths = cfg.get("paths") or {}
+    training = cfg.get("training") or {}
+
+    def pick(cli_val: Any, *keys: str, default: Any = None) -> Any:
+        if cli_val is not None:
+            return cli_val
+        section = paths if keys[0] in paths else training
+        cur: Any = section
+        for key in keys:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur if cur is not None else default
+
+    settings = {
+        "orig_features": resolve_path(
+            pick(args.orig_features, "orig_features"),
+            PATH_ROOT,
+        ),
+        "aug_features": resolve_path(
+            pick(args.aug_features, "aug_features"),
+            PATH_ROOT,
+        ),
+        "splits": resolve_path(pick(args.splits, "splits"), PATH_ROOT),
+        "pinfo": resolve_path(pick(args.pinfo, "pinfo"), PATH_ROOT),
+        "output_dir": resolve_path(
+            pick(args.output_dir, "output_dir", default="experiments/results/fmcib"),
+            PATH_ROOT,
+        ),
+        "epochs": int(pick(args.epochs, "epochs", default=100)),
+        "batch_size": int(pick(args.batch_size, "batch_size", default=32)),
+        "lr": float(pick(args.lr, "lr", default=0.0125)),
+        "scheduler_step_size": int(training.get("scheduler_step_size", 30)),
+        "scheduler_gamma": float(training.get("scheduler_gamma", 0.1)),
+    }
+    return settings
 
 
 def main() -> None:
     args = parse_args()
+    cfg = build_settings(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Config: {args.config.resolve() if args.config.exists() else args.config}")
     print(f"Device: {device}")
+    print(f"pinfo:          {cfg['pinfo']}")
+    print(f"orig_features:  {cfg['orig_features']}")
+    print(f"aug_features:   {cfg['aug_features']}")
+    print(f"splits:         {cfg['splits']}")
+    print(f"output_dir:     {cfg['output_dir']}")
+    print(
+        f"Training: epochs={cfg['epochs']} batch_size={cfg['batch_size']} "
+        f"lr={cfg['lr']} step={cfg['scheduler_step_size']} gamma={cfg['scheduler_gamma']}"
+    )
 
-    pinfo = load_pinfo(args.pinfo)
-    df_orig = attach_pinfo_labels(load_file(args.orig_features), pinfo)
-    df_aug = attach_pinfo_labels(load_file(args.aug_features), pinfo)
+    pinfo = load_pinfo(cfg["pinfo"])
+    df_orig = attach_pinfo_labels(load_file(cfg["orig_features"]), pinfo)
+    df_aug = attach_pinfo_labels(load_file(cfg["aug_features"]), pinfo)
 
     feature_cols = get_feature_cols(df_orig)
     aug_cols = get_feature_cols(df_aug)
@@ -270,10 +316,10 @@ def main() -> None:
     if len(feature_cols) != 4096:
         print(f"Warning: expected 4096 pred_* features, got {len(feature_cols)}")
 
-    folds = load_worc_splits(args.splits)
-    print(f"Loaded {len(folds)} WORC folds from {args.splits}")
-    print(f"Train source: {args.aug_features}")
-    print(f"Test source:  {args.orig_features}")
+    folds = load_worc_splits(cfg["splits"])
+    print(f"Loaded {len(folds)} WORC folds from {cfg['splits']}")
+    print(f"Train source: {cfg['aug_features']}")
+    print(f"Test source:  {cfg['orig_features']}")
 
     per_split_rows: list[dict] = []
 
@@ -289,9 +335,11 @@ def main() -> None:
             train_df=train_data,
             test_df=test_data,
             feature_cols=feature_cols,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
+            epochs=cfg["epochs"],
+            batch_size=cfg["batch_size"],
+            lr=cfg["lr"],
+            scheduler_step_size=cfg["scheduler_step_size"],
+            scheduler_gamma=cfg["scheduler_gamma"],
             device=device,
         )
         per_split_rows.append(
@@ -333,7 +381,7 @@ def main() -> None:
         ]
     )
 
-    out_dir = args.output_dir
+    out_dir = cfg["output_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
     per_split_path = out_dir / "Melanoma_mlp_cv_per_split.csv"
     summary_path = out_dir / "Melanoma_mlp_cv_summary.csv"
