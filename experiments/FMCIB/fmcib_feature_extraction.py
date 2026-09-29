@@ -20,8 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-csv",
         type=Path,
-        required=True,
-        help="Output path for the feature CSV",
+        default=None,
+        help="Output path for the feature CSV "
+        "(default: ~/experiments/Results/FMCIB/<input_stem>_features.csv)",
     )
     parser.add_argument(
         "--precropped",
@@ -72,6 +73,15 @@ def resolve_image_paths(df: pd.DataFrame, data_root: Path) -> pd.DataFrame:
 def main() -> None:
     args = parse_args()
     data_root = (args.data_root or Path.cwd()).resolve()
+
+    if args.output_csv is None:
+        args.output_csv = (
+            Path.home()
+            / "experiments"
+            / "Results"
+            / "FMCIB"
+            / f"{args.input_csv.stem}_features.csv"
+        )
 
     df = pd.read_csv(args.input_csv)
     df = resolve_image_paths(df, data_root)
