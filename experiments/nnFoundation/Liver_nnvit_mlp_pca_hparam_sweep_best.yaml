@@ -1,0 +1,16 @@
+paths:
+  orig_features: /home/lukas/Results/nnFoundation/Melanoma_nnfoundation_original_features.csv
+  aug_features: /home/lukas/Results/nnFoundation/Lesion_nnfoundation_augmentation_features.csv
+  splits: /home/lukas/crossvalidationsplits/crossvalidationsplits_Lesion.csv
+  pinfo: /home/lukas/metadata/pinfo_Lesion.csv
+  output_dir: /home/lukas/Results/nnFoundation
+training:
+  epochs: 40
+  batch_size: 16
+  lr: 0.006414963618892777
+  scheduler_step_size: 20
+  scheduler_gamma: 0.5
+  weight_decay: 0.01
+  dropout: 0.0
+pca:
+  n_components: 60
