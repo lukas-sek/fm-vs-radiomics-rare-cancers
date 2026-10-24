@@ -246,7 +246,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument(
+        "--max-splits",
+        type=int,
+        default=None,
+        help="Run only the first N WORC CV splits (default: all).",
+    )
     return parser.parse_args()
+
+
+def select_folds(folds, max_splits: int | None):
+    if max_splits is None:
+        return folds
+    if max_splits < 1:
+        raise SystemExit("--max-splits must be at least 1")
+    return folds[:max_splits]
 
 
 def build_settings(args: argparse.Namespace) -> dict[str, Any]:
@@ -285,6 +299,7 @@ def build_settings(args: argparse.Namespace) -> dict[str, Any]:
         "lr": float(pick(args.lr, "lr", default=0.0125)),
         "scheduler_step_size": int(training.get("scheduler_step_size", 30)),
         "scheduler_gamma": float(training.get("scheduler_gamma", 0.1)),
+        "max_splits": args.max_splits,
     }
     return settings
 
@@ -316,7 +331,7 @@ def main() -> None:
     if len(feature_cols) != 4096:
         print(f"Warning: expected 4096 pred_* features, got {len(feature_cols)}")
 
-    folds = load_worc_splits(cfg["splits"])
+    folds = select_folds(load_worc_splits(cfg["splits"]), cfg["max_splits"])
     print(f"Loaded {len(folds)} WORC folds from {cfg['splits']}")
     print(f"Train source: {cfg['aug_features']}")
     print(f"Test source:  {cfg['orig_features']}")
