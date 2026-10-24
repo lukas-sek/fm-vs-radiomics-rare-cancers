@@ -1,7 +1,8 @@
 """Offline 50^3 FMCIB patch extraction with dedicated single-slot augmentations.
 
 Extracts a 1.0 mm isotropic 50x50x50 patch centered on the lesion centroid, then
-applies exactly one isolated transform per variant (flip / rotate / zoom).
+applies exactly one isolated transform per variant (X flip / Poisson noise /
+X+Y flip).
 
 Inference: get_features(csv_path, precropped=True)
 
@@ -34,11 +35,22 @@ REQUIRED_COLUMNS = (
     "label",
 )
 
+OUTPUT_COLUMNS = (
+    "patient_id",
+    "lesion_id",
+    "image_path",
+    "coordX",
+    "coordY",
+    "coordZ",
+    "label",
+    "mask_source",
+)
+
 AUG_SPECS = (
     (0, "original", None),
-    (1, "flip", "flip"),
-    (2, "rotate", "rotate"),
-    (3, "zoom", "zoom"),
+    (1, "flip_x", "flip_x"),
+    (2, "poisson_noise", "poisson_noise"),
+    (3, "flip_xy", "flip_xy"),
 )
 
 
@@ -50,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-csv",
         type=Path,
-        default= REPO_ROOT /'data' / 'fmcib_CSVs' / f'fmcib_original_<dataset>.csv',
+        default=None,
         help="Input CSV (default: fmcib_CSVs/fmcib_original_<dataset>.csv)",
     )
     parser.add_argument(
@@ -151,47 +163,58 @@ def monai_to_sitk(tensor: Any, reference: sitk.Image) -> sitk.Image:
     return out
 
 
-def apply_flip(patch_t: Any) -> Any:
+def apply_flip_x(patch_t: Any) -> Any:
     from monai.transforms import Flip
 
     return Flip(spatial_axis=0)(patch_t)
 
 
-def apply_rotate(patch_t: Any) -> Any:
-    from monai.transforms import RandAffine
+def apply_flip_xy(patch_t: Any) -> Any:
+    from monai.transforms import Flip
 
-    # Torch backend (avoids scipy/torch padding_mode mismatch of RandRotate/RandZoom).
-    return RandAffine(
-        rotate_range=(0.26, 0.26, 0.26),
-        prob=1.0,
-        mode="bilinear",
-        padding_mode="border",
-    )(patch_t)
+    return Flip(spatial_axis=(0, 1))(patch_t)
 
 
-def apply_zoom(patch_t: Any) -> Any:
-    from monai.transforms import Affine
+def apply_poisson_noise(patch_t: Any, peak: float | None = None) -> Any:
+    """Apply Poisson noise while preserving the patch's original HU range."""
+    import torch
 
-    # Isotropic zoom in [0.95, 1.05] via torch Affine (border padding).
-    zoom = float(np.random.uniform(0.95, 1.05))
-    return Affine(
-        scale_params=(zoom, zoom, zoom),
-        mode="bilinear",
-        padding_mode="border",
-        image_only=True,
-    )(patch_t)
+    image = patch_t.detach().cpu().numpy().astype(np.float32, copy=False)
+    if not np.isfinite(image).all():
+        raise ValueError("Cannot apply Poisson noise to non-finite intensities")
+
+    image_min = float(image.min())
+    image_max = float(image.max())
+    intensity_range = image_max - image_min
+    if intensity_range == 0.0:
+        return patch_t.clone()
+
+    random_peak = float(np.random.uniform(40.0, 80.0) if peak is None else peak)
+    if random_peak <= 0.0:
+        raise ValueError(f"Poisson peak must be positive, got {random_peak}")
+
+    normalized = np.clip((image - image_min) / intensity_range, 0.0, 1.0)
+    noisy_normalized = np.random.poisson(normalized * random_peak) / random_peak
+    noisy_normalized = np.clip(noisy_normalized, 0.0, 1.0)
+    noisy_image = (noisy_normalized * intensity_range + image_min).astype(
+        np.float32
+    )
+    return torch.from_numpy(noisy_image).to(
+        device=patch_t.device,
+        dtype=patch_t.dtype,
+    )
 
 
 def apply_augmentation(patch: sitk.Image, aug_key: str | None) -> sitk.Image:
     if aug_key is None:
         return patch
     patch_t = sitk_to_monai(patch)
-    if aug_key == "flip":
-        out_t = apply_flip(patch_t)
-    elif aug_key == "rotate":
-        out_t = apply_rotate(patch_t)
-    elif aug_key == "zoom":
-        out_t = apply_zoom(patch_t)
+    if aug_key == "flip_x":
+        out_t = apply_flip_x(patch_t)
+    elif aug_key == "poisson_noise":
+        out_t = apply_poisson_noise(patch_t)
+    elif aug_key == "flip_xy":
+        out_t = apply_flip_xy(patch_t)
     else:
         raise ValueError(f"Unknown augmentation key: {aug_key}")
     return monai_to_sitk(out_t, patch)
@@ -215,7 +238,6 @@ def assert_fmcib_patch(patch: sitk.Image) -> None:
 
 def process_row(
     row: pd.Series,
-    dataset: str,
     out_dir: Path,
     overwrite: bool,
 ) -> list[dict]:
@@ -234,7 +256,7 @@ def process_row(
     del image  # free full volume ASAP
 
     meta_rows: list[dict] = []
-    for aug_id, aug_type, aug_key in AUG_SPECS:
+    for aug_id, _, aug_key in AUG_SPECS:
         out_name = patch_filename(patient_id, lesion_id, aug_id)
         out_path = out_dir / out_name
         rel_path = out_path.resolve().relative_to(REPO_ROOT).as_posix()
@@ -249,13 +271,14 @@ def process_row(
 
         meta_rows.append(
             {
-                "dataset": dataset,
                 "patient_id": patient_id,
                 "lesion_id": lesion_id,
-                "aug_id": aug_id,
-                "aug_type": aug_type,
                 "image_path": rel_path,
+                "coordX": center[0],
+                "coordY": center[1],
+                "coordZ": center[2],
                 "label": label,
+                "mask_source": row.get("mask_source", ""),
             }
         )
     return meta_rows
@@ -286,12 +309,12 @@ def main() -> None:
     meta_rows: list[dict] = []
     n = len(df)
     for i, (_, row) in enumerate(df.iterrows(), start=1):
-        meta_rows.extend(process_row(row, args.dataset, dataset_out, args.overwrite))
+        meta_rows.extend(process_row(row, dataset_out, args.overwrite))
         if i % 25 == 0 or i == n:
             print(f"  {args.dataset}: {i}/{n} lesions")
 
-    meta_df = pd.DataFrame(meta_rows)
-    out_csv = REPO_ROOT / 'experiments' / "fmcib_CSVs" / f"fmcib_patches_{args.dataset}.csv"
+    meta_df = pd.DataFrame(meta_rows, columns=OUTPUT_COLUMNS)
+    out_csv = REPO_ROOT / "fmcib_CSVs" / f"fmcib_patches_{args.dataset}.csv"
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     meta_df.to_csv(out_csv, index=False)
     print(f"Wrote {len(meta_df)} rows -> {out_csv.relative_to(REPO_ROOT).as_posix()}")
