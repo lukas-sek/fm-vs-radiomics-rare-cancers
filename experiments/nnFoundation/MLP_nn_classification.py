@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 DATASETS = ("Lipo", "Desmoid", "Liver", "GIST", "CRLM", "Melanoma")
 BACKBONES = ("CNN", "ViT")
 FEATURE_DIMS = {"CNN": 320, "ViT": 1056}
+HIDDEN_LAYERS = ("none", "full", "half")
 DECISION_THRESHOLD = 0.5
 SUMMARY_METRICS = (
     ("AUC", "auc"),
@@ -79,9 +80,19 @@ def feature_stem(backbone: str) -> str:
     return "nncnn" if backbone == "CNN" else "nnvit"
 
 
+def output_prefix(settings: dict[str, Any], model_name: str = "mlp") -> str:
+    """<DATASET>_<stem>[_<tag>]_<model_name>, used for all CV output files."""
+    parts = [str(settings["dataset"]), feature_stem(str(settings["backbone"]))]
+    tag = str(settings.get("output_tag") or "")
+    if tag:
+        parts.append(tag)
+    parts.append(model_name)
+    return "_".join(parts)
+
+
 def default_feature_paths(dataset: str, backbone: str) -> tuple[Path, Path]:
     stem = feature_stem(backbone)
-    root = REPO_ROOT / "Results" / "nnFoundation"
+    root = REPO_ROOT / "Results" / "nnFoundation" / "Features"
     return (
         root / f"{dataset}_{stem}_features.csv",
         root / f"{dataset}_{stem}_augmented_features.csv",
@@ -115,7 +126,11 @@ class ClassificationHead(nn.Module):
 
 
 class MLP(ClassificationHead):
-    """Binary classification head over frozen embeddings."""
+    """Binary classification head over frozen embeddings.
+
+    With ``hidden_dim`` set, ``num_hidden_layers`` hidden layers of that width
+    (each Linear -> ReLU -> Dropout) precede the linear classifier.
+    """
 
     def __init__(
         self,
@@ -123,13 +138,52 @@ class MLP(ClassificationHead):
         num_classes: int = 1,
         dropout: float = 0.0,
         init_std: float | None = None,
+        hidden_dim: int | None = None,
+        num_hidden_layers: int = 1,
     ):
+        if hidden_dim is not None and hidden_dim < 1:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+        if num_hidden_layers < 1:
+            raise ValueError(
+                f"num_hidden_layers must be positive, got {num_hidden_layers}"
+            )
         super().__init__(
-            input_dim=in_features,
+            input_dim=in_features if hidden_dim is None else hidden_dim,
             num_classes=num_classes,
             dropout=dropout,
             init_std=init_std,
         )
+        self.in_features = in_features
+        self.hidden_dim = hidden_dim
+        self.num_hidden_layers = 0 if hidden_dim is None else num_hidden_layers
+        layers: list[nn.Module] = []
+        width = in_features
+        for _ in range(self.num_hidden_layers):
+            layers += [nn.Linear(width, hidden_dim), nn.ReLU(), nn.Dropout(dropout)]
+            width = hidden_dim
+        self.hidden = nn.Sequential(*layers) if layers else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(self.hidden(x))
+
+
+def hidden_dim_for(in_features: int, hidden_layer: str) -> int | None:
+    """Map a ``HIDDEN_LAYERS`` mode to the hidden width for ``in_features``."""
+    if hidden_layer == "none":
+        return None
+    if hidden_layer == "full":
+        return in_features
+    if hidden_layer == "half":
+        return max(1, in_features // 2)
+    raise ValueError(
+        f"Unknown hidden_layer {hidden_layer!r}; choose from {HIDDEN_LAYERS}"
+    )
+
+
+def output_suffix(hidden_layer: str, num_hidden_layers: int = 1) -> str:
+    if hidden_layer == "none":
+        return "mlp"
+    return f"mlp_h{num_hidden_layers}{hidden_layer}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,10 +214,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--splits", type=Path, default=None)
     parser.add_argument("--pinfo", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--output-tag",
+        default=None,
+        help=(
+            "Optional tag inserted into output names, e.g. b29 -> "
+            "<DATASET>_nnvit_b29_mlp_cv_*.csv (default: none)."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    add_hidden_layer_argument(parser)
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -176,6 +239,29 @@ def parse_args() -> argparse.Namespace:
         help="Run only the first N WORC CV splits (default: all).",
     )
     return parser.parse_args()
+
+
+def add_hidden_layer_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--hidden-layer",
+        choices=HIDDEN_LAYERS,
+        default=None,
+        help=(
+            "Hidden layer before the classifier: none (linear head), "
+            "full (width = input dim) or half (width = input dim / 2). "
+            "Overrides training.hidden_layer in the config (default: none)."
+        ),
+    )
+    parser.add_argument(
+        "--num-hidden-layers",
+        type=int,
+        choices=(1, 2),
+        default=None,
+        help=(
+            "Number of hidden layers of the --hidden-layer width. "
+            "Overrides training.num_hidden_layers in the config (default: 1)."
+        ),
+    )
 
 
 def resolve_path(path: str | Path) -> Path:
@@ -237,6 +323,7 @@ def build_settings(args: argparse.Namespace) -> dict[str, Any]:
             args.pinfo or REPO_ROOT / "metadata" / f"pinfo_{dataset}.csv"
         ),
         "output_dir": resolve_path(args.output_dir or feature_root),
+        "output_tag": getattr(args, "output_tag", None) or "",
         "epochs": int(training_value(args.epochs, "epochs", 100)),
         "batch_size": int(training_value(args.batch_size, "batch_size", 32)),
         "lr": float(training_value(args.lr, "lr", 0.0125)),
@@ -244,6 +331,16 @@ def build_settings(args: argparse.Namespace) -> dict[str, Any]:
         "scheduler_gamma": float(training.get("scheduler_gamma", 0.1)),
         "weight_decay": float(training.get("weight_decay", 0.0)),
         "dropout": float(training.get("dropout", 0.0)),
+        "hidden_layer": str(
+            training_value(
+                getattr(args, "hidden_layer", None), "hidden_layer", "none"
+            )
+        ),
+        "num_hidden_layers": int(
+            training_value(
+                getattr(args, "num_hidden_layers", None), "num_hidden_layers", 1
+            )
+        ),
         "seed": int(training_value(args.seed, "seed", 42)),
         "device": args.device,
         "max_splits": (
@@ -260,6 +357,10 @@ def build_settings(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("lr must be positive")
     if not 0.0 <= settings["dropout"] < 1.0:
         raise SystemExit("dropout must be in [0, 1)")
+    if settings["hidden_layer"] not in HIDDEN_LAYERS:
+        raise SystemExit(f"hidden_layer must be one of {HIDDEN_LAYERS}")
+    if settings["num_hidden_layers"] not in (1, 2):
+        raise SystemExit("num_hidden_layers must be 1 or 2")
     return settings
 
 
@@ -691,9 +792,14 @@ def run_split(
         seed=fold_seed,
     )
     device = torch.device(settings["device"])
+    in_features = int(settings["feature_dim"])
     model = MLP(
-        in_features=int(settings["feature_dim"]),
+        in_features=in_features,
         dropout=float(settings.get("dropout", 0.0)),
+        hidden_dim=hidden_dim_for(
+            in_features, settings.get("hidden_layer", "none")
+        ),
+        num_hidden_layers=int(settings.get("num_hidden_layers", 1)),
     ).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -772,7 +878,10 @@ def main() -> None:
         f"step={settings['scheduler_step_size']} "
         f"gamma={settings['scheduler_gamma']} "
         f"weight_decay={settings['weight_decay']} "
-        f"dropout={settings['dropout']} seed={settings['seed']}"
+        f"dropout={settings['dropout']} "
+        f"hidden_layer={settings['hidden_layer']} "
+        f"num_hidden_layers={settings['num_hidden_layers']} "
+        f"seed={settings['seed']}"
     )
 
     pinfo = load_pinfo(settings["pinfo"])
@@ -833,7 +942,10 @@ def main() -> None:
     patient_predictions = pd.concat(prediction_frames, ignore_index=True)
     output_dir = settings["output_dir"]
     output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"{settings['dataset']}_{feature_stem(str(settings['backbone']))}_mlp"
+    prefix = output_prefix(
+        settings,
+        output_suffix(settings["hidden_layer"], settings["num_hidden_layers"]),
+    )
     per_split_path = output_dir / f"{prefix}_cv_per_split.csv"
     summary_path = output_dir / f"{prefix}_cv_summary.csv"
     predictions_path = output_dir / f"{prefix}_cv_patient_predictions.csv"

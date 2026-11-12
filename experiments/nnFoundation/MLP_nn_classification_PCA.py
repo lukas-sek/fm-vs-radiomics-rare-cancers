@@ -90,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    base.add_hidden_layer_argument(parser)
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -196,6 +197,10 @@ def run_split(
     model = MLP(
         n_components,
         dropout=float(settings.get("dropout", 0.0)),
+        hidden_dim=base.hidden_dim_for(
+            n_components, settings.get("hidden_layer", "none")
+        ),
+        num_hidden_layers=int(settings.get("num_hidden_layers", 1)),
     ).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -327,7 +332,10 @@ def main() -> None:
         f"batch_size={settings['batch_size']} lr={settings['lr']} "
         f"step={settings['scheduler_step_size']} "
         f"gamma={settings['scheduler_gamma']} "
-        f"weight_decay={settings['weight_decay']} seed={settings['seed']}"
+        f"weight_decay={settings['weight_decay']} "
+        f"hidden_layer={settings['hidden_layer']} "
+        f"num_hidden_layers={settings['num_hidden_layers']} "
+        f"seed={settings['seed']}"
     )
 
     labels = base.load_pinfo(settings["pinfo"])
@@ -404,7 +412,10 @@ def main() -> None:
     output_dir = settings["output_dir"]
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = base.feature_stem(str(settings["backbone"]))
-    prefix = f"{settings['dataset']}_{stem}_mlp_pca"
+    suffix = base.output_suffix(
+        settings["hidden_layer"], settings["num_hidden_layers"]
+    )
+    prefix = f"{settings['dataset']}_{stem}_{suffix}_pca"
     per_split_path = output_dir / f"{prefix}_cv_per_split.csv"
     summary_path = output_dir / f"{prefix}_cv_summary.csv"
     predictions_path = output_dir / f"{prefix}_cv_patient_predictions.csv"
