@@ -117,6 +117,54 @@ def resolve_paths(args: argparse.Namespace) -> dict[str, Path]:
     }
 
 
+def build_splits(splits_csv: Path, cases: pd.DataFrame) -> list[dict[str, list[str]]]:
+    """WORC outer splits with a patient-grouped 1/7 validation hold-out.
+
+    ``cases`` needs ``patient_id``, ``case_id`` and ``label`` columns. The
+    validation patients depend only on the training patient list and labels,
+    so every GloViTa dataset built from the same cohort shares them.
+    """
+    splits_df = pd.read_csv(splits_csv, index_col=0)
+    patient_to_cases = cases.groupby("patient_id")["case_id"].apply(list).to_dict()
+    patient_to_label = cases.groupby("patient_id")["label"].first().to_dict()
+
+    num_splits = len(
+        [col for col in splits_df.columns if col.endswith("_train")]
+    )
+    splits = []
+
+    for i in range(num_splits):
+        train_patients = splits_df[f"{i}_train"].dropna().astype(str).tolist()
+        test_patients = splits_df[f"{i}_test"].dropna().astype(str).tolist()
+
+        train_patients = [p for p in train_patients if p in patient_to_cases]
+        test_patients = [p for p in test_patients if p in patient_to_cases]
+
+        train_labels = [patient_to_label[p] for p in train_patients]
+        sgkf = StratifiedGroupKFold(n_splits=7, shuffle=True, random_state=42 + i)
+        tr_idx, val_idx = next(
+            sgkf.split(train_patients, train_labels, train_patients)
+        )
+
+        actual_train_patients = [train_patients[idx] for idx in tr_idx]
+        val_patients = [train_patients[idx] for idx in val_idx]
+
+        train_cases = [
+            c for p in actual_train_patients for c in patient_to_cases[p]
+        ]
+        val_cases = [c for p in val_patients for c in patient_to_cases[p]]
+        test_cases = [c for p in test_patients for c in patient_to_cases[p]]
+
+        splits.append(
+            {
+                "train": train_cases,
+                "val": val_cases,
+                "test": test_cases,
+            }
+        )
+    return splits
+
+
 def main() -> None:
     args = parse_args()
     paths = resolve_paths(args)
@@ -192,44 +240,7 @@ def main() -> None:
     )
 
     print(f"Generating splits from {splits_csv}...")
-    splits_df = pd.read_csv(splits_csv, index_col=0)
-    patient_to_cases = df.groupby("patient_id")["case_id"].apply(list).to_dict()
-    patient_to_label = df.groupby("patient_id")["label"].first().to_dict()
-
-    num_splits = len(
-        [col for col in splits_df.columns if col.endswith("_train")]
-    )
-    splits = []
-
-    for i in range(num_splits):
-        train_patients = splits_df[f"{i}_train"].dropna().astype(str).tolist()
-        test_patients = splits_df[f"{i}_test"].dropna().astype(str).tolist()
-
-        train_patients = [p for p in train_patients if p in patient_to_cases]
-        test_patients = [p for p in test_patients if p in patient_to_cases]
-
-        train_labels = [patient_to_label[p] for p in train_patients]
-        sgkf = StratifiedGroupKFold(n_splits=7, shuffle=True, random_state=42 + i)
-        tr_idx, val_idx = next(
-            sgkf.split(train_patients, train_labels, train_patients)
-        )
-
-        actual_train_patients = [train_patients[idx] for idx in tr_idx]
-        val_patients = [train_patients[idx] for idx in val_idx]
-
-        train_cases = [
-            c for p in actual_train_patients for c in patient_to_cases[p]
-        ]
-        val_cases = [c for p in val_patients for c in patient_to_cases[p]]
-        test_cases = [c for p in test_patients for c in patient_to_cases[p]]
-
-        splits.append(
-            {
-                "train": train_cases,
-                "val": val_cases,
-                "test": test_cases,
-            }
-        )
+    splits = build_splits(splits_csv, df)
 
     (output_dir / "splits.json").write_text(
         json.dumps(splits, indent=2) + "\n", encoding="utf-8"

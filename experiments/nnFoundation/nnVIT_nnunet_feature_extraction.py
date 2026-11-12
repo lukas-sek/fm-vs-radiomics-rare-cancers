@@ -5,6 +5,11 @@ the nnFoundationViT checkpoint. For each connected foreground component in the
 preprocessed segmentation, this script crops the plan's patch size around the
 component, runs the frozen Primus encoder (patch embed + EVA), and mean-pools
 its tokens.
+
+With ``--blocks`` the tokens of selected intermediate EVA blocks are
+mean-pooled as well (one CSV per block). With ``--token-cache-dir`` the
+spatially pooled patch tokens of one block are written to a float16 ``.npy``
+for token-level heads such as attention pooling.
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ import hashlib
 import json
 import os
 import random
+import struct
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -24,6 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy import ndimage
 
 
@@ -173,6 +180,42 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Global seed for reproducible nnU-Net augmentations (default: 42).",
     )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "EVA block indices to mean-pool (for example 19 29 34 39). Writes "
+            "one *_nnvit_b<L>_*features.csv per block. Default: only the final "
+            "encoder output, written to the usual CSV name."
+        ),
+    )
+    parser.add_argument(
+        "--token-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Write pooled patch tokens of --token-block to "
+            "<dir>/tokens_b<L>.npy (float16, rows x tokens x features) plus "
+            "index.csv and tokens_meta.json."
+        ),
+    )
+    parser.add_argument(
+        "--token-block",
+        type=int,
+        default=None,
+        help="EVA block whose tokens are cached (default: last block).",
+    )
+    parser.add_argument(
+        "--token-pool",
+        type=int,
+        default=2,
+        help=(
+            "Average-pool the token grid by this factor per axis before "
+            "caching (default: 2, i.e. 24^3 -> 12^3 tokens)."
+        ),
+    )
     parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
     parser.add_argument("--checkpoint-filename", default=DEFAULT_FILENAME)
     return parser.parse_args()
@@ -198,6 +241,14 @@ def default_output_csv(
         else "nnvit_features"
     )
     return REPO_ROOT / "Results" / "nnFoundation" / f"{cohort_name}_{suffix}.csv"
+
+
+def block_output_csv(output_csv: Path, block: int) -> Path:
+    """Tag a feature CSV path with an EVA block: X_nnvit_... -> X_nnvit_b<L>_..."""
+    name = output_csv.name
+    if "_nnvit_" in name:
+        return output_csv.with_name(name.replace("_nnvit_", f"_nnvit_b{block}_", 1))
+    return output_csv.with_name(f"{output_csv.stem}_b{block}{output_csv.suffix}")
 
 
 def import_nnunet() -> dict[str, Any]:
@@ -683,37 +734,26 @@ def primus_input_shape(model: Any) -> tuple[int, int, int]:
     return resolved
 
 
-@torch.inference_mode()
-def extract_embedding(
-    model: Any,
-    patch: np.ndarray,
-    device: torch.device,
-    use_amp: bool,
-) -> np.ndarray:
-    expected = primus_input_shape(model)
-    spatial = tuple(int(size) for size in patch.shape[1:])
-    if spatial != expected:
-        raise ValueError(
-            f"Patch spatial size {spatial} does not match Primus "
-            f"input_shape {expected}"
-        )
+def eva_depth(model: Any) -> int:
+    blocks = getattr(model.eva, "blocks", None)
+    return 0 if blocks is None else len(blocks)
 
-    tensor = torch.from_numpy(np.ascontiguousarray(patch)).unsqueeze(0)
-    tensor = tensor.to(device, non_blocking=device.type == "cuda")
-    amp_context = (
-        torch.autocast(device_type="cuda", dtype=torch.float16)
-        if use_amp and device.type == "cuda"
-        else nullcontext()
-    )
-    with amp_context:
-        embedded = model.down_projection(tensor)
-        tokens = embedded.flatten(2).transpose(1, 2)
-        tokens, _ = model.eva(tokens)
-        if tokens.ndim != 3:
-            raise RuntimeError(
-                f"Expected (B, tokens, features), got {tokens.shape}"
+
+def resolve_blocks(model: Any, blocks: Sequence[int] | None) -> list[int]:
+    """Validate requested EVA block indices; default is the last block."""
+    depth = eva_depth(model)
+    if not blocks:
+        return [depth - 1]
+    resolved = sorted({int(block) for block in blocks})
+    for block in resolved:
+        if not 0 <= block < depth:
+            raise ValueError(
+                f"Block index {block} out of range for {depth} EVA blocks"
             )
-        embedding = tokens.mean(dim=1)
+    return resolved
+
+
+def _validated_embedding(embedding: torch.Tensor, model: Any) -> np.ndarray:
     result = embedding.squeeze(0).float().cpu().numpy()
     if result.ndim != 1 or not np.isfinite(result).all():
         raise RuntimeError(f"Invalid embedding shape or values: {result.shape}")
@@ -723,6 +763,174 @@ def extract_embedding(
             f"Expected {expected_dim} features, got {result.size}"
         )
     return result
+
+
+def pool_token_grid(
+    tokens: torch.Tensor,
+    grid: Sequence[int],
+    pool: int,
+) -> np.ndarray:
+    """Average-pool (1, X*Y*Z, D) tokens on their 3D grid; return float16 (T, D)."""
+    if tokens.ndim != 3 or tokens.shape[0] != 1:
+        raise ValueError(f"Expected tokens shaped (1, T, D), got {tuple(tokens.shape)}")
+    grid = tuple(int(size) for size in grid)
+    if len(grid) != 3 or int(np.prod(grid)) != tokens.shape[1]:
+        raise ValueError(
+            f"Token count {tokens.shape[1]} does not match grid {grid}"
+        )
+    if pool < 1:
+        raise ValueError("token pool factor must be at least 1")
+    if pool > 1:
+        if any(size % pool for size in grid):
+            raise ValueError(f"Token grid {grid} is not divisible by pool {pool}")
+        volume = tokens.float().transpose(1, 2).reshape(1, tokens.shape[2], *grid)
+        volume = F.avg_pool3d(volume, kernel_size=pool)
+        tokens = volume.flatten(2).transpose(1, 2)
+    return tokens.squeeze(0).to(torch.float16).cpu().numpy()
+
+
+@torch.inference_mode()
+def extract_block_embeddings(
+    model: Any,
+    patch: np.ndarray,
+    device: torch.device,
+    use_amp: bool,
+    blocks: Sequence[int] = (),
+    token_block: int | None = None,
+    token_pool: int = 1,
+) -> tuple[dict[int, np.ndarray], np.ndarray | None]:
+    """Mean-pooled tokens per requested EVA block (+ optional pooled token grid).
+
+    Intermediate block outputs pass through ``eva.norm`` so they are
+    normalised like the final encoder output. The last block (and an empty
+    ``blocks``) maps to the unmodified ``eva`` output.
+    """
+    expected = primus_input_shape(model)
+    spatial = tuple(int(size) for size in patch.shape[1:])
+    if spatial != expected:
+        raise ValueError(
+            f"Patch spatial size {spatial} does not match Primus "
+            f"input_shape {expected}"
+        )
+
+    final_block = eva_depth(model) - 1
+    requested = list(blocks) if blocks else [final_block]
+    needed = set(requested)
+    if token_block is not None:
+        needed.add(token_block)
+    hooked = sorted(block for block in needed if block != final_block)
+
+    captured: dict[int, torch.Tensor] = {}
+
+    def capture(block: int):
+        def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
+            captured[block] = output[0] if isinstance(output, tuple) else output
+
+        return hook
+
+    handles = [
+        model.eva.blocks[block].register_forward_hook(capture(block))
+        for block in hooked
+    ]
+    tensor = torch.from_numpy(np.ascontiguousarray(patch)).unsqueeze(0)
+    tensor = tensor.to(device, non_blocking=device.type == "cuda")
+    amp_context = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if use_amp and device.type == "cuda"
+        else nullcontext()
+    )
+    try:
+        with amp_context:
+            embedded = model.down_projection(tensor)
+            grid = tuple(int(size) for size in embedded.shape[2:])
+            tokens = embedded.flatten(2).transpose(1, 2)
+            tokens, _ = model.eva(tokens)
+            if tokens.ndim != 3:
+                raise RuntimeError(
+                    f"Expected (B, tokens, features), got {tokens.shape}"
+                )
+            norm = getattr(model.eva, "norm", None)
+            outputs = {final_block: tokens}
+            for block in hooked:
+                outputs[block] = (
+                    norm(captured[block]) if norm is not None else captured[block]
+                )
+            pooled = {
+                block: _validated_embedding(outputs[block].mean(dim=1), model)
+                for block in requested
+            }
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    cached_tokens = (
+        pool_token_grid(outputs[token_block], grid, token_pool)
+        if token_block is not None
+        else None
+    )
+    return pooled, cached_tokens
+
+
+def extract_embedding(
+    model: Any,
+    patch: np.ndarray,
+    device: torch.device,
+    use_amp: bool,
+) -> np.ndarray:
+    pooled, _ = extract_block_embeddings(model, patch, device, use_amp)
+    return next(iter(pooled.values()))
+
+
+class TokenCacheWriter:
+    """Stream (T, D) float16 token arrays into a single ``.npy`` file.
+
+    The row count is unknown until extraction ends, so a fixed-size header is
+    reserved up front and rewritten with the final shape on ``close``.
+    """
+
+    HEADER_BYTES = 256
+    MAGIC = b"\x93NUMPY\x01\x00"
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.rows = 0
+        self.token_shape: tuple[int, int] | None = None
+        self._handle = path.open("wb")
+        self._handle.write(b"\0" * self.HEADER_BYTES)
+
+    def append(self, tokens: np.ndarray) -> int:
+        array = np.ascontiguousarray(tokens, dtype=np.float16)
+        if array.ndim != 2:
+            raise ValueError(f"Expected (tokens, features), got {array.shape}")
+        if self.token_shape is None:
+            self.token_shape = (int(array.shape[0]), int(array.shape[1]))
+        elif array.shape != self.token_shape:
+            raise ValueError(
+                f"Token shape changed from {self.token_shape} to {array.shape}"
+            )
+        self._handle.write(array.tobytes())
+        self.rows += 1
+        return self.rows - 1
+
+    def close(self) -> None:
+        if self._handle.closed:
+            return
+        shape = (self.rows, *(self.token_shape or (0, 0)))
+        header = repr(
+            {
+                "descr": np.lib.format.dtype_to_descr(np.dtype(np.float16)),
+                "fortran_order": False,
+                "shape": shape,
+            }
+        ).encode("latin1")
+        body_length = self.HEADER_BYTES - len(self.MAGIC) - 2
+        if len(header) + 1 > body_length:
+            raise RuntimeError("Token cache header does not fit reserved space")
+        body = header + b" " * (body_length - len(header) - 1) + b"\n"
+        self._handle.seek(0)
+        self._handle.write(self.MAGIC + struct.pack("<H", body_length) + body)
+        self._handle.close()
 
 
 def resolve_plans_managers(
@@ -749,7 +957,17 @@ def extract_dataset(
     augmentation_seed: int = 42,
     augmentation_transform: Any | None = None,
     initial_patch_size: Sequence[int] | None = None,
-) -> pd.DataFrame:
+    blocks: Sequence[int] | None = None,
+    token_writer: TokenCacheWriter | None = None,
+    token_block: int | None = None,
+    token_pool: int = 1,
+) -> dict[int, pd.DataFrame]:
+    """Return one feature frame per EVA block (same rows, same order).
+
+    When ``token_writer`` is given, the pooled tokens of ``token_block`` are
+    appended in row order and the row's cache index is stored as
+    ``token_row``.
+    """
     if num_augmentations < 0:
         raise ValueError("num_augmentations must not be negative")
     if num_augmentations > 0 and (
@@ -766,9 +984,18 @@ def extract_dataset(
             f"Plans patch size {resolved_patch} does not match Primus "
             f"input_shape {expected_shape}"
         )
+    resolved_blocks = resolve_blocks(model, blocks)
+    if token_writer is not None:
+        if token_block is None:
+            token_block = eva_depth(model) - 1
+        resolve_blocks(model, [token_block])
+    else:
+        token_block = None
 
     rows: list[dict[str, Any]] = []
-    feature_count: int | None = None
+    embeddings: dict[int, list[np.ndarray]] = {
+        block: [] for block in resolved_blocks
+    }
 
     for case_number, case_id in enumerate(dataset.identifiers, start=1):
         data, segmentation, _ = dataset.load_case(case_id)
@@ -820,15 +1047,22 @@ def extract_dataset(
                 )
 
             for augmentation_id, augmentation_type, seed, patch in variants:
-                embedding = extract_embedding(
-                    model, patch, device=device, use_amp=use_amp
+                pooled, cached_tokens = extract_block_embeddings(
+                    model,
+                    patch,
+                    device=device,
+                    use_amp=use_amp,
+                    blocks=resolved_blocks,
+                    token_block=token_block,
+                    token_pool=token_pool,
                 )
-                if feature_count is None:
-                    feature_count = int(embedding.size)
-                elif embedding.size != feature_count:
-                    raise RuntimeError(
-                        "Feature dimensionality changed between lesion patches"
-                    )
+                for block, embedding in pooled.items():
+                    previous = embeddings[block]
+                    if previous and embedding.size != previous[0].size:
+                        raise RuntimeError(
+                            "Feature dimensionality changed between lesion patches"
+                        )
+                    previous.append(embedding)
                 row: dict[str, Any] = {
                     "case_id": case_id,
                     "segmentation_label": label_value,
@@ -841,12 +1075,8 @@ def extract_dataset(
                     "augmentation_type": augmentation_type,
                     "augmentation_seed": seed,
                 }
-                row.update(
-                    {
-                        f"feature_{index}": float(value)
-                        for index, value in enumerate(embedding)
-                    }
-                )
+                if token_writer is not None and cached_tokens is not None:
+                    row["token_row"] = token_writer.append(cached_tokens)
                 rows.append(row)
 
         print(
@@ -858,7 +1088,16 @@ def extract_dataset(
     print()
     if not rows:
         raise RuntimeError("No embeddings were extracted")
-    return pd.DataFrame(rows)
+    metadata = pd.DataFrame(rows)
+    frames: dict[int, pd.DataFrame] = {}
+    for block, block_embeddings in embeddings.items():
+        values = np.stack(block_embeddings).astype(np.float64)
+        features = pd.DataFrame(
+            values,
+            columns=[f"feature_{index}" for index in range(values.shape[1])],
+        )
+        frames[block] = pd.concat([metadata, features], axis=1)
+    return frames
 
 
 def main() -> None:
@@ -867,6 +1106,8 @@ def main() -> None:
         raise SystemExit("--min-component-voxels must be at least 1")
     if args.num_augmentations < 0:
         raise SystemExit("--num-augmentations must not be negative")
+    if args.token_pool < 1:
+        raise SystemExit("--token-pool must be at least 1")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but is not available")
@@ -983,44 +1224,107 @@ def main() -> None:
             f"{initial_patch_size}"
         )
 
-    features = extract_dataset(
-        model,
-        dataset,
-        configuration_manager.patch_size,
-        device,
-        args.min_component_voxels,
-        args.empty_mask,
-        use_amp=not args.no_amp,
-        num_augmentations=args.num_augmentations,
-        augmentation_seed=args.augmentation_seed,
-        augmentation_transform=augmentation_transform,
-        initial_patch_size=initial_patch_size,
-    )
+    blocks = resolve_blocks(model, args.blocks)
+    token_writer: TokenCacheWriter | None = None
+    token_block: int | None = None
+    if args.token_cache_dir is not None:
+        token_block = (
+            args.token_block
+            if args.token_block is not None
+            else eva_depth(model) - 1
+        )
+        resolve_blocks(model, [token_block])
+        token_cache_dir = resolve_cli_path(args.token_cache_dir)
+        token_writer = TokenCacheWriter(token_cache_dir / f"tokens_b{token_block}.npy")
+        print(
+            f"Caching block-{token_block} tokens (pool {args.token_pool}) -> "
+            f"{token_writer.path}"
+        )
+
+    try:
+        frames = extract_dataset(
+            model,
+            dataset,
+            configuration_manager.patch_size,
+            device,
+            args.min_component_voxels,
+            args.empty_mask,
+            use_amp=not args.no_amp,
+            num_augmentations=args.num_augmentations,
+            augmentation_seed=args.augmentation_seed,
+            augmentation_transform=augmentation_transform,
+            initial_patch_size=initial_patch_size,
+            blocks=blocks,
+            token_writer=token_writer,
+            token_block=token_block,
+            token_pool=args.token_pool,
+        )
+    finally:
+        if token_writer is not None:
+            token_writer.close()
+
     if case_metadata is None:
         metadata_path = dataset_root / "worc_case_metadata.csv"
         if metadata_path.is_file():
             case_metadata = pd.read_csv(metadata_path)
     if case_metadata is not None:
-        features = features.merge(
-            case_metadata,
-            on="case_id",
-            how="left",
-            validate="many_to_one",
-        )
+        frames = {
+            block: frame.merge(
+                case_metadata,
+                on="case_id",
+                how="left",
+                validate="many_to_one",
+            )
+            for block, frame in frames.items()
+        }
     output_csv = (
         resolve_cli_path(args.output_csv)
         if args.output_csv is not None
         else default_output_csv(dataset_name, args.num_augmentations)
     )
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    features.to_csv(output_csv, index=False)
-    feature_columns = sum(
-        column.startswith("feature_") for column in features.columns
-    )
-    print(
-        f"Wrote {len(features)} lesion embeddings with {feature_columns} "
-        f"features -> {output_csv}"
-    )
+    for block, features in frames.items():
+        block_csv = (
+            block_output_csv(output_csv, block)
+            if args.blocks is not None
+            else output_csv
+        )
+        features.to_csv(block_csv, index=False)
+        feature_columns = sum(
+            column.startswith("feature_") for column in features.columns
+        )
+        print(
+            f"Wrote {len(features)} block-{block} lesion embeddings with "
+            f"{feature_columns} features -> {block_csv}"
+        )
+
+    if token_writer is not None:
+        any_frame = next(iter(frames.values()))
+        index = any_frame[
+            [column for column in any_frame.columns if not column.startswith("feature_")]
+        ]
+        index.to_csv(token_writer.path.parent / "index.csv", index=False)
+        tokens_per_row, embed_dim = token_writer.token_shape or (0, 0)
+        (token_writer.path.parent / "tokens_meta.json").write_text(
+            json.dumps(
+                {
+                    "tokens_file": token_writer.path.name,
+                    "block": token_block,
+                    "token_pool": args.token_pool,
+                    "rows": token_writer.rows,
+                    "tokens_per_row": tokens_per_row,
+                    "embed_dim": embed_dim,
+                    "dtype": "float16",
+                    "num_augmentations": args.num_augmentations,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print(
+            f"Wrote {token_writer.rows} x {tokens_per_row} x {embed_dim} tokens "
+            f"-> {token_writer.path} (+ index.csv, tokens_meta.json)"
+        )
 
 
 if __name__ == "__main__":
