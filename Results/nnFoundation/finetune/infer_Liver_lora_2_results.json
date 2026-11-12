@@ -1,0 +1,13 @@
+{
+  "Accuracy": 0.6052631735801697,
+  "F1": 0.6027874946594238,
+  "trainable_params": 162626,
+  "total_params": 551527330,
+  "trainable_fraction": 0.0002948648075155224,
+  "epoch": 24,
+  "best_epoch": 24,
+  "checkpoint": "best",
+  "checkpoint_paths": [
+    "Results/nnFoundation/finetune_vit_lora/generic_3d_dataset/20261102_112544_nnfoundationencoder_classificationhead_lora_00299379/2/checkpoints/best.pt"
+  ]
+}
