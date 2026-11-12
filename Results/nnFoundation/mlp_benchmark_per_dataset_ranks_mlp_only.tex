@@ -1,0 +1,20 @@
+% Requires \usepackage{booktabs,amsmath}
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccc}
+\toprule
+Dataset & CNN + MLP & CNN + MLP$_\text{PCA}$ & ViT + MLP & ViT + MLP$_\text{PCA}$ & $\chi^2_F$ & $p$ \\
+\midrule
+Lipo & 0.723 $\pm$ 0.092 (2.75\textsuperscript{AB}) & 0.702 $\pm$ 0.086 (3.60\textsuperscript{B}) & 0.783 $\pm$ 0.088 (2.10\textsuperscript{A}) & \textbf{0.808 $\pm$ 0.081 (1.55\textsuperscript{A})} & 14.30 & 0.003 \\
+Desmoid & 0.699 $\pm$ 0.066 (3.60\textsuperscript{C}) & 0.703 $\pm$ 0.078 (3.40\textsuperscript{BC}) & \textbf{0.853 $\pm$ 0.062 (1.00\textsuperscript{A})} & 0.835 $\pm$ 0.065 (2.00\textsuperscript{AB}) & 27.12 & $<$0.001 \\
+Liver & 0.567 $\pm$ 0.084 (3.40\textsuperscript{B}) & 0.580 $\pm$ 0.069 (3.30\textsuperscript{B}) & \textbf{0.761 $\pm$ 0.111 (1.50\textsuperscript{A})} & 0.748 $\pm$ 0.107 (1.80\textsuperscript{A}) & 17.64 & $<$0.001 \\
+GIST & 0.655 $\pm$ 0.044 (3.00\textsuperscript{A}) & 0.634 $\pm$ 0.075 (3.20\textsuperscript{A}) & \textbf{0.745 $\pm$ 0.056 (1.90\textsuperscript{A})} & \textbf{0.735 $\pm$ 0.072 (1.90\textsuperscript{A})} & 8.76 & 0.033 \\
+CRLM & 0.470 $\pm$ 0.180 (3.10\textsuperscript{A}) & 0.457 $\pm$ 0.168 (2.65\textsuperscript{A}) & \textbf{0.537 $\pm$ 0.125 (2.05\textsuperscript{A})} & 0.512 $\pm$ 0.127 (2.20\textsuperscript{A}) & 4.31 & 0.230 \\
+Melanoma & 0.438 $\pm$ 0.148 (2.70\textsuperscript{AB}) & 0.368 $\pm$ 0.097 (3.40\textsuperscript{B}) & \textbf{0.505 $\pm$ 0.120 (1.70\textsuperscript{A})} & 0.498 $\pm$ 0.119 (2.20\textsuperscript{AB}) & 9.48 & 0.024 \\
+\bottomrule
+\end{tabular}
+\caption{Per-dataset comparison over 10 paired CV splits. Cells show AUC mean $\pm$ SD and, in parentheses, the mean Friedman rank (lower is better) with Nemenyi group letters; methods sharing a letter do not differ significantly ($\alpha=0.05$, CD$=1.48$). Best mean rank in bold. $\chi^2_F$ and $p$ refer to the Friedman omnibus test per dataset.}
+\label{tab:mlp_per_dataset_friedman}
+\end{table*}

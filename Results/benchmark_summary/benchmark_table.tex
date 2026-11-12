@@ -1,0 +1,18 @@
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{AUROC [95\% CI] comparison across cohorts and methods. Mean ranks are Friedman ranks (1 = best). Iman--Davenport omnibus $F=18.684$ ($p=1.6e-06$). Holm-adjusted one-sided Wilcoxon $p$-values test whether AutoML CASH (WORC) outperforms each competitor across cohorts.}
+\label{tab:all_methods_benchmark}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}l cccccc cc@{}}
+\toprule
+\textbf{Method} & \textbf{Lipo} & \textbf{Desmoid} & \textbf{Liver} & \textbf{GIST} & \textbf{CRLM} & \textbf{Melanoma} & \textbf{Mean Rank} & \textbf{Holm $p$ vs WORC} \\
+\midrule
+AutoML CASH (WORC) & 0.83 [0.76--0.90] & 0.84 [0.77--0.90] & 0.82 [0.76--0.88] & 0.76 [0.70--0.83] & 0.66 [0.55--0.77] & 0.49 [0.40--0.58] & 1.7 & --- \\
+CNN + mlp & 0.76 [0.66--0.84] & 0.67 [0.58--0.75] & 0.59 [0.50--0.68] & 0.67 [0.60--0.74] & 0.51 [0.36--0.66] & 0.43 [0.31--0.55] & 4.2 & 0.0625 \\
+CNN + mlp_pca & 0.72 [0.62--0.81] & 0.66 [0.57--0.74] & 0.61 [0.52--0.70] & 0.65 [0.58--0.72] & 0.50 [0.35--0.65] & 0.42 [0.30--0.54] & 4.8 & 0.0625 \\
+ViT + mlp & 0.79 [0.69--0.87] & 0.86 [0.79--0.92] & 0.78 [0.70--0.84] & 0.74 [0.67--0.80] & 0.57 [0.42--0.71] & 0.50 [0.38--0.63] & 2.2 & 0.1562 \\
+ViT + mlp_pca & 0.81 [0.72--0.89] & 0.84 [0.77--0.90] & 0.76 [0.68--0.83] & 0.74 [0.67--0.80] & 0.53 [0.38--0.67] & 0.52 [0.40--0.65] & 2.2 & 0.1562 \\
+\bottomrule
+\end{tabular*}
+\end{table*}

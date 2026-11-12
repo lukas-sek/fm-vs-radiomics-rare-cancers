@@ -1,0 +1,20 @@
+% Requires \usepackage{booktabs,amsmath}
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccccc}
+\toprule
+Dataset & CNN + MLP & CNN + MLP$_\text{PCA}$ & ViT + MLP & ViT + MLP$_\text{PCA}$ & WORC & $\chi^2_F$ & $p$ \\
+\midrule
+Lipo & 0.723 $\pm$ 0.092 (3.75\textsuperscript{BC}) & 0.702 $\pm$ 0.086 (4.60\textsuperscript{C}) & 0.783 $\pm$ 0.088 (2.90\textsuperscript{ABC}) & 0.808 $\pm$ 0.081 (2.25\textsuperscript{AB}) & \textbf{0.842 $\pm$ 0.057 (1.50\textsuperscript{A})} & 24.02 & $<$0.001 \\
+Desmoid & 0.699 $\pm$ 0.066 (4.40\textsuperscript{B}) & 0.703 $\pm$ 0.078 (4.30\textsuperscript{B}) & \textbf{0.853 $\pm$ 0.062 (1.50\textsuperscript{A})} & 0.835 $\pm$ 0.065 (2.50\textsuperscript{AB}) & 0.824 $\pm$ 0.075 (2.30\textsuperscript{A}) & 26.56 & $<$0.001 \\
+Liver & 0.567 $\pm$ 0.084 (4.40\textsuperscript{B}) & 0.580 $\pm$ 0.069 (4.30\textsuperscript{B}) & 0.761 $\pm$ 0.111 (2.30\textsuperscript{A}) & 0.748 $\pm$ 0.107 (2.60\textsuperscript{AB}) & \textbf{0.821 $\pm$ 0.053 (1.40\textsuperscript{A})} & 27.44 & $<$0.001 \\
+GIST & 0.655 $\pm$ 0.044 (4.00\textsuperscript{B}) & 0.634 $\pm$ 0.075 (4.10\textsuperscript{B}) & 0.745 $\pm$ 0.056 (2.40\textsuperscript{AB}) & 0.735 $\pm$ 0.072 (2.60\textsuperscript{AB}) & \textbf{0.779 $\pm$ 0.054 (1.90\textsuperscript{A})} & 15.76 & 0.003 \\
+CRLM & 0.470 $\pm$ 0.180 (3.80\textsuperscript{B}) & 0.457 $\pm$ 0.168 (3.45\textsuperscript{AB}) & 0.537 $\pm$ 0.125 (2.95\textsuperscript{AB}) & 0.512 $\pm$ 0.127 (3.10\textsuperscript{AB}) & \textbf{0.635 $\pm$ 0.107 (1.70\textsuperscript{A})} & 10.49 & 0.033 \\
+Melanoma & 0.438 $\pm$ 0.148 (3.40\textsuperscript{AB}) & 0.368 $\pm$ 0.097 (4.20\textsuperscript{B}) & \textbf{0.505 $\pm$ 0.120 (2.20\textsuperscript{A})} & 0.498 $\pm$ 0.119 (2.80\textsuperscript{AB}) & 0.487 $\pm$ 0.068 (2.40\textsuperscript{AB}) & 10.56 & 0.032 \\
+\bottomrule
+\end{tabular}
+\caption{Per-dataset comparison over 10 paired CV splits. Cells show AUC mean $\pm$ SD and, in parentheses, the mean Friedman rank (lower is better) with Nemenyi group letters; methods sharing a letter do not differ significantly ($\alpha=0.05$, CD$=1.93$). Best mean rank in bold. $\chi^2_F$ and $p$ refer to the Friedman omnibus test per dataset.}
+\label{tab:mlp_per_dataset_friedman}
+\end{table*}

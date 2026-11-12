@@ -1,0 +1,7 @@
+Dataset,Top_Method,Top_Mean_SD,Runner_Up,Runner_Up_Mean_SD,Diff,t_stat,df,p_value,Verdict
+Lipo,WORC + radiomics,0.834 ± 0.069,ViT + mlp_pca,0.808 ± 0.077,0.026,1.0318,10.51,0.3253,Statistical Tie
+Desmoid,ViT + mlp,0.853 ± 0.059,WORC + radiomics,0.836 ± 0.066,0.0175,0.8846,11.36,0.3947,Statistical Tie
+Liver,WORC + radiomics,0.816 ± 0.058,ViT + mlp,0.761 ± 0.105,0.0548,1.6219,9.56,0.1373,Statistical Tie
+GIST,WORC + radiomics,0.762 ± 0.061,ViT + mlp,0.745 ± 0.053,0.0172,0.9576,11.5,0.358,Statistical Tie
+CRLM,WORC + radiomics,0.660 ± 0.112,ViT + mlp,0.537 ± 0.119,0.123,3.1426,10.66,0.0097,Decisive Winner
+Melanoma,ViT + mlp,0.505 ± 0.114,ViT + mlp_pca,0.498 ± 0.113,0.0073,0.1432,18.0,0.8877,Statistical Tie
