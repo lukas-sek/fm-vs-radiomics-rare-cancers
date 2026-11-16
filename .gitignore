@@ -160,6 +160,10 @@ venv.bak/
 # Local medical imaging data
 /data/
 
+# Cached foundation-model embeddings (large; keep local only)
+**/*_features.csv
+**/Features/
+
 # Spyder project settings
 .spyderproject
 .spyproject
