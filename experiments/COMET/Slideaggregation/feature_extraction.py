@@ -445,6 +445,12 @@ def main() -> None:
     feature_columns = [f"feature_{index}" for index in range(EMBEDDING_DIM)]
     index = pd.DataFrame(rows, columns=[*META_COLUMNS, *feature_columns])
     index.to_csv(output_csv, index=False)
+    # When augmented rows are present, also write the original-only CSV the MLP expects.
+    if args.num_augmentations > 0 and args.output_csv is None:
+        orig_csv = default_output_csv(args.dataset, args.fov, num_augmentations=0)
+        orig_rows = index.loc[index["augmentation_id"] == 0].copy()
+        orig_rows.to_csv(orig_csv, index=False)
+        print(f"Wrote {len(orig_rows)} original embeddings -> {orig_csv}")
     total_bytes = sum(path.stat().st_size for path in cache_dir.glob("*.pt"))
     print(f"Wrote {len(index)} variants of {index['case_id'].nunique()} lesions -> {output_csv}")
     print(f"Embedding cache ({total_bytes / 1024**3:.2f} GB) -> {cache_dir}")
