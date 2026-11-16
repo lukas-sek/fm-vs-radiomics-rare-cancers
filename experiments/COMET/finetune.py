@@ -25,6 +25,8 @@ os.environ.setdefault("MMM_LICENSE_ACCEPTED", "i accept")
 os.environ.setdefault("LOGFIRE_IGNORE_NO_CONFIG", "1")
 os.environ.setdefault("WANDB_MODE", "offline")
 
+import json
+
 import numpy as np
 import pandas as pd
 import torch
@@ -32,13 +34,17 @@ import wandb
 from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedShuffleSplit
 from mmm.api.M3Model import DEFAULT_MODEL, M3_MODELS
 from mmm.data_loading.MTLDataset import flatten_list, mtl_collate
 from mmm.interactive import api, blocks, configs as cfs, data, tasks, training
-from mmm.mmm_types.GroupUsage import GroupUsage, MaskingStrategy
+from mmm.mmm_types.GroupUsage import GroupingStrategy, GroupUsage, MaskingStrategy
 from mmm.mtl_modules.shared_blocks.Grouper import Grouper, MHAReducer
 
 COMET_DIR = Path(__file__).resolve().parent
@@ -54,6 +60,17 @@ CLASS_NAMES = ["class0", "class1"]
 DEFAULT_ARCHIVE = REPO_ROOT / "data" / "comet" / DEFAULT_MODEL
 DEFAULT_CACHE_ROOT = REPO_ROOT / "data" / "comet" / "cache"
 DEFAULT_FEATURES_DIR = REPO_ROOT / "Results" / "COMET" / "Features"
+SUMMARY_METRICS = (
+    ("AUROC", "auroc"),
+    ("AP", "ap"),
+    ("Accuracy", "accuracy"),
+    ("BCA", "bca"),
+    ("F1", "f1"),
+    ("Precision", "precision"),
+    ("Sensitivity", "sensitivity"),
+    ("Specificity", "specificity"),
+    ("NPV", "npv"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -399,6 +416,12 @@ def ensure_checkpoint(path: Path) -> Path:
     return path
 
 
+def _safe_rate(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return float("nan")
+    return float(numerator) / float(denominator)
+
+
 def classification_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
     labels = np.asarray(y_true, dtype=np.int64)
     scores = np.asarray(y_score, dtype=np.float64)
@@ -409,11 +432,70 @@ def classification_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict[str,
     else:
         auc = float(roc_auc_score(labels, scores))
         ap = float(average_precision_score(labels, scores))
+    tn, fp, fn, tp = confusion_matrix(labels, predicted, labels=[0, 1]).ravel()
+    sensitivity = _safe_rate(tp, tp + fn)
+    specificity = _safe_rate(tn, tn + fp)
+    precision = _safe_rate(tp, tp + fp)
+    npv = _safe_rate(tn, tn + fn)
     return {
         "auroc": auc,
         "ap": ap,
-        "bca": float(balanced_accuracy_score(labels, predicted)),
         "accuracy": float((predicted == labels).mean()) if labels.size else float("nan"),
+        "bca": float(balanced_accuracy_score(labels, predicted)),
+        "f1": float(f1_score(labels, predicted, zero_division=0)),
+        "precision": float(precision_score(labels, predicted, zero_division=0))
+        if not np.isnan(precision)
+        else precision,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "npv": npv,
+        "recall": float(recall_score(labels, predicted, zero_division=0)),
+    }
+
+
+def metric_summary(per_split: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for display_name, column in SUMMARY_METRICS:
+        if column not in per_split.columns:
+            continue
+        values = per_split[column].to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            lower, upper = np.percentile(finite, [2.5, 97.5])
+        else:
+            lower, upper = float("nan"), float("nan")
+        rows.append(
+            {
+                "metric": display_name,
+                "mean": float(np.nanmean(values)),
+                "std": float(np.nanstd(values)),
+                "median": float(np.nanmedian(values)),
+                "ci_95_lower": float(lower),
+                "ci_95_upper": float(upper),
+                "n_splits": len(per_split),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def patient_prediction_bundle(predictions: list[dict]) -> dict:
+    """Patient-level tensors for an nnFoundation-style predictions.pt payload."""
+    pred_frame = pd.DataFrame(predictions)
+    patient = pred_frame.groupby("patient_id", sort=False).agg(
+        label=("label", "first"),
+        score=("score", "mean"),
+        case_id=("case_id", lambda s: ",".join(map(str, s))),
+    )
+    scores = patient["score"].to_numpy(dtype=np.float64)
+    probs = np.stack([1.0 - scores, scores], axis=1)
+    preds = (scores >= 0.5).astype(np.int64)
+    return {
+        "preds": torch.as_tensor(preds, dtype=torch.long),
+        "labels": torch.as_tensor(patient["label"].to_numpy(), dtype=torch.long),
+        "probs": torch.as_tensor(probs, dtype=torch.float32),
+        "case_ids": patient["case_id"].tolist(),
+        "patient_ids": patient.index.tolist(),
+        "n_patients": int(len(patient)),
     }
 
 
@@ -421,6 +503,54 @@ def patient_metrics(rows: list[dict]) -> dict[str, float]:
     frame = pd.DataFrame(rows)
     grouped = frame.groupby("patient_id", sort=False).agg(label=("label", "first"), score=("score", "mean"))
     return classification_metrics(grouped["label"].to_numpy(), grouped["score"].to_numpy())
+
+
+def lesion_rows_from_batch(
+    metas: list[dict],
+    supercase_indices: torch.Tensor,
+    probs: np.ndarray,
+    targets: np.ndarray,
+) -> list[dict]:
+    """Collapse token- or group-level model outputs to one row per lesion bag.
+
+    ``grouping=single`` → one logit per unique supercase.
+    ``grouping=full`` (mmm default) → one logit per token; mean-pool scores per bag.
+    """
+    scores = probs[:, 1] if probs.ndim == 2 and probs.shape[1] > 1 else np.asarray(probs).reshape(-1)
+    targets = np.asarray(targets).reshape(-1)
+    indices = supercase_indices.detach().cpu().tolist()
+    n_tokens = len(metas)
+    if len(scores) not in (n_tokens, len(set(indices))):
+        raise ValueError(
+            f"Cannot align outputs: n_scores={len(scores)}, n_tokens={n_tokens}, "
+            f"n_groups={len(set(indices))}"
+        )
+
+    # Map each unique supercase id -> token positions / representative meta.
+    groups: dict[int, list[int]] = {}
+    for token_i, case_i in enumerate(indices):
+        groups.setdefault(int(case_i), []).append(token_i)
+
+    rows: list[dict] = []
+    unique_sorted = sorted(groups)
+    for rank, case_i in enumerate(unique_sorted):
+        token_is = groups[case_i]
+        meta = metas[token_is[0]]
+        if len(scores) == n_tokens:
+            score = float(np.mean(scores[token_is]))
+            label = int(targets[token_is[0]])
+        else:
+            score = float(scores[rank])
+            label = int(targets[rank])
+        rows.append(
+            {
+                "patient_id": str(meta.get("patient_id")),
+                "case_id": str(meta.get("case_id")),
+                "label": label,
+                "score": score,
+            }
+        )
+    return rows
 
 
 @torch.no_grad()
@@ -456,28 +586,16 @@ def evaluate_cases(
         supercase_indices = Grouper.extract_ids_from_batch(
             group_ids, for_task_name=task.get_name()
         ).to(device)
-        grouped_labels = grouper.group_targets(labels, supercase_indices, task.args.grouper_key)
         logits = task.forward((images, supercase_indices, contexts), shared)
-        probs = torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy()
-        targets = grouped_labels.detach().cpu().numpy()
-        # One row per grouped lesion (first token of each group_id in batch order).
-        seen: dict[str, int] = {}
-        order: list[str] = []
-        for meta in metas:
-            group_id = str(meta.get("group_id"))
-            if group_id not in seen:
-                seen[group_id] = len(order)
-                order.append(group_id)
-        for group_id, score, label in zip(order, probs, targets, strict=True):
-            meta = next(m for m in metas if str(m.get("group_id")) == group_id)
-            rows.append(
-                {
-                    "patient_id": str(meta.get("patient_id")),
-                    "case_id": str(meta.get("case_id")),
-                    "label": int(label),
-                    "score": float(score),
-                }
-            )
+        probs = torch.softmax(logits.float(), dim=1).cpu().numpy()
+        # Prefer raw token labels when outputs are per-token (grouping=full).
+        if probs.shape[0] == labels.shape[0]:
+            targets = labels.detach().cpu().numpy()
+        else:
+            targets = grouper.group_targets(
+                labels, supercase_indices, task.args.grouper_key
+            ).detach().cpu().numpy()
+        rows.extend(lesion_rows_from_batch(metas, supercase_indices, probs, targets))
     return rows, patient_metrics(rows)
 
 
@@ -515,7 +633,12 @@ def run_split(
         hidden_dim=squeezer.get_hidden_dim(),
         args=tasks.ClassificationTask.Config(
             module_name=f"worc_{args.dataset}_split{split_index:02d}",
-            grouper_key=GroupUsage(grouper_key="grouper", masking=MaskingStrategy.fullattention),
+            grouper_key=GroupUsage(
+                grouper_key="grouper",
+                masking=MaskingStrategy.fullattention,
+                # One pooled embedding per lesion bag (not per slice / mmm default "full").
+                grouping=GroupingStrategy.single,
+            ),
         ),
         cohort=cohort,
     )
@@ -564,17 +687,24 @@ def run_split(
             args.batch_size,
             device,
         )
+        bundle = patient_prediction_bundle(predictions)
+        pred_path = output_dir / f"infer_{args.dataset}_split{split_index:02d}.pt"
+        torch.save(bundle, pred_path)
+        print(f"Wrote {pred_path}")
         print(
             f"Split {split_index:02d} test (last ckpt, patient-level): "
             f"AUROC={metrics['auroc']:.4f} AP={metrics['ap']:.4f} BCA={metrics['bca']:.4f}"
         )
         return {
-            "split": split_index,
-            "n_train_lesions": len(train_cases),
-            "n_val_lesions": len(val_cases),
-            "n_test_lesions": len(test_cases),
-            "n_test_patients": pd.DataFrame(predictions)["patient_id"].nunique(),
-            **metrics,
+            "metrics": {
+                "split": split_index,
+                "n_train_lesions": len(train_cases),
+                "n_val_lesions": len(val_cases),
+                "n_test_lesions": len(test_cases),
+                "n_test_patients": bundle["n_patients"],
+                **metrics,
+            },
+            "predictions": bundle,
         }
     finally:
         wandb.finish()
@@ -610,6 +740,14 @@ def main() -> None:
     )
 
     per_split_rows: list[dict] = []
+    split_payloads: list[dict] = []
+    all_preds: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+    all_probs: list[torch.Tensor] = []
+    all_case_ids: list[str] = []
+    all_patient_ids: list[str] = []
+    all_split_ids: list[int] = []
+
     for split_index, (train_patients, test_patients) in enumerate(folds):
         try:
             fit_patients, val_patients = holdout_from_train(
@@ -627,25 +765,81 @@ def main() -> None:
                 stacklevel=1,
             )
             continue
-        per_split_rows.append(
-            run_split(
-                split_index,
-                train_cases,
-                val_cases,
-                test_cases,
-                args,
-                cache_dir,
-                output_dir,
-                device,
-            )
+        result = run_split(
+            split_index,
+            train_cases,
+            val_cases,
+            test_cases,
+            args,
+            cache_dir,
+            output_dir,
+            device,
         )
+        metrics_row = result["metrics"]
+        bundle = result["predictions"]
+        per_split_rows.append(metrics_row)
+        split_payloads.append(
+            {
+                "split": split_index,
+                "metrics": metrics_row,
+                "preds": bundle["preds"],
+                "labels": bundle["labels"],
+                "probs": bundle["probs"],
+                "case_ids": bundle["case_ids"],
+                "patient_ids": bundle["patient_ids"],
+            }
+        )
+        n = int(bundle["preds"].shape[0])
+        all_preds.append(bundle["preds"])
+        all_labels.append(bundle["labels"])
+        all_probs.append(bundle["probs"])
+        all_case_ids.extend(bundle["case_ids"])
+        all_patient_ids.extend(bundle["patient_ids"])
+        all_split_ids.extend([split_index] * n)
 
     if not per_split_rows:
         raise SystemExit("No splits produced test metrics")
+
     per_split = pd.DataFrame(per_split_rows)
-    per_split_path = output_dir / f"{args.dataset}_tokens_cv_per_split.csv"
+    summary = metric_summary(per_split)
+    summary_records = summary.to_dict(orient="records")
+    prefix = f"{args.dataset}_tokens"
+    per_split_path = output_dir / f"{prefix}_cv_per_split.csv"
+    summary_csv_path = output_dir / f"{prefix}_cv_summary.csv"
+    summary_json_path = output_dir / f"{prefix}_cv_summary.json"
+    all_splits_pt = output_dir / f"{prefix}_cv_all_splits.pt"
+
     per_split.to_csv(per_split_path, index=False)
+    summary.to_csv(summary_csv_path, index=False)
+    summary_json_path.write_text(json.dumps(summary_records, indent=2) + "\n")
+    torch.save(
+        {
+            "dataset": args.dataset,
+            "n_splits": len(split_payloads),
+            "preds": torch.cat(all_preds, dim=0),
+            "labels": torch.cat(all_labels, dim=0),
+            "probs": torch.cat(all_probs, dim=0),
+            "case_ids": all_case_ids,
+            "patient_ids": all_patient_ids,
+            "splits": torch.as_tensor(all_split_ids, dtype=torch.long),
+            "per_split": split_payloads,
+            "per_split_metrics": per_split.to_dict(orient="records"),
+            "summary": summary_records,
+        },
+        all_splits_pt,
+    )
+
+    print("\n--- Summary across splits ---")
+    for _, row in summary.iterrows():
+        print(
+            f"{row['metric']} 95%: {row['mean']:.4f} "
+            f"({row['ci_95_lower']:.4f}-{row['ci_95_upper']:.4f}); "
+            f"mean ± SD {row['mean']:.4f} ± {row['std']:.4f}"
+        )
     print(f"Wrote {per_split_path}")
+    print(f"Wrote {summary_csv_path}")
+    print(f"Wrote {summary_json_path}")
+    print(f"Wrote {all_splits_pt}")
 
 
 if __name__ == "__main__":

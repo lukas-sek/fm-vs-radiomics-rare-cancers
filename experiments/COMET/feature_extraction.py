@@ -1,9 +1,11 @@
 """Cache frozen UMedPT slice tokens per WORC lesion for grouper fine-tuning.
 
-Each lesion is cropped to a 3D patch (``preprocess.load_worc_lesion_patch``),
-run through mmm ``Tomo3DProcessor``, and sliced. The frozen encoder + squeezer
-produce one 512-d token per slice. ``augmentation_id=0`` is the original;
-``--num-augmentations`` extra variants use ``Tomo3DProcessor.base_volume_augs``.
+Loads full in-plane slices over the lesion Z extent
+(``preprocess.load_worc_lesion_slices``), runs mmm ``Tomo3DProcessor``, and
+keeps every lesion-covering slice (``umedpt.lesion_slice_stack``, ``fov=full``).
+The frozen encoder + squeezer produce one 512-d token per slice.
+``augmentation_id=0`` is the original; ``--num-augmentations`` extra variants
+use ``Tomo3DProcessor.base_volume_augs``.
 
 Example:
     python experiments/COMET/feature_extraction.py --dataset Liver --num-augmentations 10
@@ -19,7 +21,6 @@ import time
 import warnings
 import zlib
 from pathlib import Path
-from typing import Any
 
 os.environ.setdefault("MMM_LICENSE_ACCEPTED", "i accept")
 os.environ.setdefault("LOGFIRE_IGNORE_NO_CONFIG", "1")
@@ -29,7 +30,7 @@ import pandas as pd
 import torch
 from monai.utils import set_determinism
 from mmm.api.M3Model import DEFAULT_MODEL, M3_MODELS, M3Model
-from mmm.transforms import RandomApply, UnifySizes
+from mmm.transforms import RandomApply
 from mmm.volume3d import Tomo3DProcessor
 
 COMET_DIR = Path(__file__).resolve().parent
@@ -48,7 +49,8 @@ from build_nnFoundation_lesion_patches import (  # noqa: E402
     resolve_label,
 )
 from prepare_worc_nnunet_dataset import safe_identifier  # noqa: E402
-from preprocess import load_worc_lesion_patch  # noqa: E402
+from preprocess import load_worc_lesion_slices  # noqa: E402
+from umedpt import lesion_slice_stack  # noqa: E402
 
 DEFAULT_ARCHIVE = REPO_ROOT / "data" / "comet" / DEFAULT_MODEL
 DEFAULT_CACHE_ROOT = REPO_ROOT / "data" / "comet" / "cache"
@@ -62,7 +64,6 @@ INDEX_COLUMNS = (
     "mask_source",
     "augmentation_id",
     "augmentation_seed",
-    "margin",
     "z_margin",
     "n_slices",
     "slice_start",
@@ -77,8 +78,12 @@ INDEX_COLUMNS = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--dataset", required=True, choices=DATASETS)
-    parser.add_argument("--margin", type=int, default=16, help="In-plane crop margin in voxels.")
-    parser.add_argument("--z-margin", type=int, default=0, help="Slice-axis crop margin in voxels.")
+    parser.add_argument(
+        "--z-margin",
+        type=int,
+        default=0,
+        help="Extra slices kept beyond the lesion Z extent (full in-plane FOV).",
+    )
     parser.add_argument(
         "--num-augmentations",
         type=int,
@@ -143,24 +148,6 @@ def build_processor(seed: int | None) -> Tomo3DProcessor:
         set_determinism(seed=seed)
         augs = lambda keys: seed_transforms(Tomo3DProcessor.base_volume_augs(keys), seed)  # noqa: E731
     return Tomo3DProcessor(Tomo3DProcessor.Config(rotate_3d="never"), augs, with_segmask=True)
-
-
-def patch_slice_stack(
-    processor: Tomo3DProcessor,
-    processed: dict[str, Any],
-    max_edge_len: int = 512,
-    divisable_by: int = 32,
-) -> tuple[torch.Tensor, list[int]]:
-    """All slices of a processed 3D lesion patch as ``(S, 3, H, W)`` in [0, 1]."""
-    slices = processor.extract_slices(processed)
-    if not slices:
-        raise ValueError("Processed patch has no slices")
-    images = torch.stack([processor.repeat_channels(s["image"]) for s in slices]).float()
-    resized = UnifySizes(divisable_by=divisable_by, max_edge_len=max_edge_len)(
-        [{"image": img} for img in images]
-    )
-    images = torch.stack([torch.as_tensor(case["image"]) for case in resized]).float()
-    return images.contiguous(), list(range(len(slices)))
 
 
 def ensure_checkpoint(path: Path) -> Path:
@@ -257,6 +244,7 @@ def main() -> None:
             "output_csv": str(output_csv),
             "amp": amp,
             "feature": "squeezer_token_512",
+            "fov": "full",
             "encoder_frozen": True,
             "squeezer_frozen": True,
         }
@@ -275,24 +263,23 @@ def main() -> None:
     lesions = list(iter_lesions(args.dataset, worc_root, args.patients, args.max_patients))
     print(
         f"{args.dataset}: {len(lesions)} lesions, K={args.num_augmentations}, "
-        f"margin={args.margin}, z_margin={args.z_margin}, device={device}"
+        f"fov=full, z_margin={args.z_margin}, device={device}"
     )
 
     for lesion_index, (patient_dir, case_id, lesion_id, mask_path, mask_source) in enumerate(lesions, start=1):
         patient_id = patient_dir.name
         label = int(resolve_label(args.dataset, patient_id, lesion_id, pinfo))
-        patch = None
+        volume = None
 
         for augmentation_id in range(args.num_augmentations + 1):
             out_path = cache_dir / f"{case_id}__aug{augmentation_id}.pt"
             if out_path.is_file() and not args.overwrite:
                 entry = torch.load(out_path, map_location="cpu", weights_only=True)
             else:
-                if patch is None:
-                    patch = load_worc_lesion_patch(
+                if volume is None:
+                    volume = load_worc_lesion_slices(
                         resolve_image_path(patient_dir, lesion_id),
                         mask_path,
-                        margin=args.margin,
                         z_margin=args.z_margin,
                     )
                 entry = None
@@ -303,9 +290,11 @@ def main() -> None:
                     try:
                         processor = build_processor(seed)
                         processed = processor(
-                            {"image": patch["image"].clone(), "label": patch["label"].clone()}
+                            {"image": volume["image"].clone(), "label": volume["label"].clone()}
                         )
-                        stack, slice_indices = patch_slice_stack(processor, processed)
+                        stack, slice_indices = lesion_slice_stack(
+                            processor, processed, fov="full", z_margin=0
+                        )
                     except ValueError as error:
                         if augmentation_id == 0:
                             raise ValueError(f"{case_id}: {error}") from error
@@ -337,7 +326,6 @@ def main() -> None:
                     "mask_source": mask_source or "",
                     "augmentation_id": augmentation_id,
                     "augmentation_seed": int(entry["augmentation_seed"]),
-                    "margin": args.margin,
                     "z_margin": args.z_margin,
                     "n_slices": len(slice_indices),
                     "slice_start": slice_indices[0],
